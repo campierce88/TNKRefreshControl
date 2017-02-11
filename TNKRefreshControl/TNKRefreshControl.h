@@ -45,6 +45,9 @@ FOUNDATION_EXPORT const unsigned char TNKRefreshControlVersionString[];
  */
 - (void)endRefreshing;
 
+// call this method if the layout for the refresh control was changed and needs to be updated
+- (void)layoutDidChange;
+
 /** A Boolean value indicating whether a refresh operation has been triggered and is in progress. (read-only)
  */
 @property (nonatomic, readonly, getter=isRefreshing) BOOL refreshing;
@@ -69,6 +72,14 @@ FOUNDATION_EXPORT const unsigned char TNKRefreshControlVersionString[];
  @see addedInsets
  */
 - (void)resetContentInset;
+
+/** Set to true if you do not want the view being pushed down by the refresh control
+ 
+ @param preventAdjustment if true the refresh control will not shift the scroll view down when presented
+ */
+- (void)preventAdjustingOfScrollView:(BOOL)preventAdjustment;
+
+- (void)cleanup;
 
 @end
 

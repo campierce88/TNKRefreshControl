@@ -30,6 +30,8 @@ typedef NS_ENUM(NSUInteger, TNKRefreshControlState) {
 	TNKActivityIndicatorView *_activityIndicator;
 	TNKRefreshControlState _state;
 	BOOL _ignoreOffsetChanged;// sometimes we aren't done yet
+	BOOL _preventScrollViewAdjustment;
+	CGFloat _originalY;
 }
 
 @end
@@ -93,7 +95,8 @@ typedef NS_ENUM(NSUInteger, TNKRefreshControlState) {
 - (instancetype)initWithFrame:(CGRect)frame
 {
 	frame.size.height = TNKRefreshControlHeight;
-	
+	_originalY = frame.origin.y;
+
 	self = [super initWithFrame:frame];
 	if (self != nil) {
 		//        self.backgroundColor = [[UIColor redColor] colorWithAlphaComponent:0.1];
@@ -106,6 +109,21 @@ typedef NS_ENUM(NSUInteger, TNKRefreshControlState) {
 	return self;
 }
 
+- (void)preventAdjustingOfScrollView:(BOOL)preventAdjustment {
+	_preventScrollViewAdjustment = preventAdjustment;
+}
+
+- (void)setFrame:(CGRect)frame
+{
+	[super setFrame:frame];
+	frame.size.height = TNKRefreshControlHeight;
+//    _originalY = frame.origin.y;
+}
+
+- (void)layoutDidChange {
+	_originalY = self.frame.origin.y;
+}
+
 - (UIScrollView *)_scrollViewForSuperview:(UIView *)superview
 {
 	UIScrollView *scrollView = (UIScrollView *)superview;
@@ -114,6 +132,42 @@ typedef NS_ENUM(NSUInteger, TNKRefreshControlState) {
 	}
 	
 	return scrollView;
+}
+
+- (void)dealloc {
+	UIScrollView *oldScrollView = [self _scrollViewForSuperview:self.superview];
+
+	@try {
+		[oldScrollView removeObserver:self forKeyPath:@"contentOffset" context:TNKScrollViewContext];
+	}
+	@catch (NSException *exception) {
+		NSLog(@"%@", exception.reason);
+	}
+	
+	@try {
+		[_scrollView removeObserver:self forKeyPath:@"contentOffset" context:TNKScrollViewContext];
+	}
+	@catch (NSException *exception) {
+		NSLog(@"%@", exception.reason);
+	}
+}
+
+- (void)cleanup {
+	UIScrollView *oldScrollView = [self _scrollViewForSuperview:self.superview];
+	
+	@try {
+		[oldScrollView removeObserver:self forKeyPath:@"contentOffset" context:TNKScrollViewContext];
+	}
+	@catch (NSException *exception) {
+		NSLog(@"%@", exception.reason);
+	}
+	
+	@try {
+		[_scrollView removeObserver:self forKeyPath:@"contentOffset" context:TNKScrollViewContext];
+	}
+	@catch (NSException *exception) {
+		NSLog(@"%@", exception.reason);
+	}
 }
 
 - (void)willMoveToSuperview:(UIView *)newSuperview
@@ -131,12 +185,30 @@ typedef NS_ENUM(NSUInteger, TNKRefreshControlState) {
 	}
 	
 	UIScrollView *scrollView = [self _scrollViewForSuperview:newSuperview];
+	
+	if (scrollView != nil) {
+		self.scrollView = scrollView;
+	}
+}
+
+- (void)setScrollView:(UIScrollView *)scrollView {
+	_scrollView = scrollView;
+	
+	// we have an awkward situation here when the scrollView is deallocated before setting self.refreshControl to nil
+	// our weak property is usually niled out by the time this is called, but odly self.superview is still correct
+	// if we let the scrollView be autoreleased, it will be gone and deallocated by the time the autorelease pool is drained
+	@autoreleasepool {
+		UIScrollView *oldScrollView = [self _scrollViewForSuperview:self.superview];
+		[oldScrollView removeObserver:self forKeyPath:@"contentOffset" context:TNKScrollViewContext];
+		[self resetContentInset];
+		[oldScrollView.panGestureRecognizer removeTarget:self action:@selector(panScrollView:)];
+	}
+	
 	[scrollView addObserver:self forKeyPath:@"contentOffset" options:0 context:TNKScrollViewContext];
 	[scrollView.panGestureRecognizer addTarget:self action:@selector(panScrollView:)];
 	
-	self.scrollView = scrollView;
-	
 	[self _layoutScrollView];
+
 }
 
 - (void)layoutSubviews
@@ -163,50 +235,62 @@ typedef NS_ENUM(NSUInteger, TNKRefreshControlState) {
 			frameY = self.scrollView.contentOffset.y + self.scrollView.contentInset.top - self.addedContentInset.top;
 		}
 	}
-	self.frame = CGRectMake(0.0, frameY,
-							self.scrollView.bounds.size.width, TNKRefreshControlHeight);
+	if (!_preventScrollViewAdjustment) {
+		self.frame = CGRectMake(0.0, frameY, self.scrollView.bounds.size.width, TNKRefreshControlHeight);
+	}
 	
 	switch (_state) {
-			case TNKRefreshControlStateWaiting: {
-				if (!self.scrollView.dragging) {
+		case TNKRefreshControlStateWaiting: {
+			if (!self.scrollView.dragging) {
+				[self setAddedContentInset:UIEdgeInsetsMake(0.0, 0.0, 0.0, 0.0)];
+			}
+			
+			CGFloat distance = -self.frame.origin.y - 10.0;
+			CGFloat threshold = 0.0;
+			CGFloat percent = 0.0;
+
+			if (_preventScrollViewAdjustment) {
+				distance = self.frame.origin.y - _originalY;
+				threshold = 0.0;
+			}
+
+			if (distance > threshold) {
+				if (NSClassFromString(@"UITraitCollection") && self.traitCollection.verticalSizeClass == UIUserInterfaceSizeClassCompact) {
+					percent = pow(distance / 50.0, 2); // http://cl.ly/image/0O280G3C3H3M
+				} else {
+					percent = pow(2.0, distance / fabs(_originalY - 60.0)) - 1.0; // http://cl.ly/image/2r3y0h0Z0B01
+				}
+			}
+			
+			_activityIndicator.progress = percent;
+			
+			if (percent >= 1.0) {
+				[self beginRefreshingVisibly:NO animated:NO];
+				[self sendActionsForControlEvents:UIControlEventValueChanged];
+			}
+			
+			break;
+		} case TNKRefreshControlStateEnding: {
+			if (self.scrollView.contentOffset.y >= -(self.scrollView.contentInset.top - self.addedContentInset.top)) {
+				_state = TNKRefreshControlStateWaiting;
+			}
+			
+			if (!self.scrollView.dragging) {
+				[self setAddedContentInset:UIEdgeInsetsMake(0.0, 0.0, 0.0, 0.0)];
+			}
+			
+			break;
+		} case TNKRefreshControlStateRefreshing: {
+			if (!self.scrollView.dragging) {
+				if (_preventScrollViewAdjustment) {
 					[self setAddedContentInset:UIEdgeInsetsMake(0.0, 0.0, 0.0, 0.0)];
-				}
-				
-				CGFloat distance = -self.frame.origin.y - 10.0;
-				CGFloat percent = 0.0;
-				if (distance > 0.0) {
-					if (NSClassFromString(@"UITraitCollection") && self.traitCollection.verticalSizeClass == UIUserInterfaceSizeClassCompact) {
-						percent = pow(distance / 50.0, 2); // http://cl.ly/image/0O280G3C3H3M
-					} else {
-						percent = pow(2.0, distance / 60.0) - 1.0; // http://cl.ly/image/2r3y0h0Z0B01
-					}
-				}
-				
-				_activityIndicator.progress = percent;
-				
-				if (percent >= 1.0) {
-					[self beginRefreshingVisibly:NO animated:NO];
-					[self sendActionsForControlEvents:UIControlEventValueChanged];
-				}
-				
-				break;
-			} case TNKRefreshControlStateEnding: {
-				if (self.scrollView.contentOffset.y >= -(self.scrollView.contentInset.top - self.addedContentInset.top)) {
-					_state = TNKRefreshControlStateWaiting;
-				}
-				
-				if (!self.scrollView.dragging) {
-					[self setAddedContentInset:UIEdgeInsetsMake(0.0, 0.0, 0.0, 0.0)];
-				}
-				
-				break;
-			} case TNKRefreshControlStateRefreshing: {
-				if (!self.scrollView.dragging) {
+				} else {
 					[self setAddedContentInset:UIEdgeInsetsMake(self.bounds.size.height, 0.0, 0.0, 0.0)];
 				}
-				
-				break;
 			}
+			
+			break;
+		}
 	}
 }
 
@@ -230,7 +314,9 @@ typedef NS_ENUM(NSUInteger, TNKRefreshControlState) {
 	if (visibly) {
 		CGPoint contentOffset = self.scrollView.contentOffset;
 		contentOffset.y = -self.scrollView.contentInset.top - self.frame.size.height;
-		[self.scrollView setContentOffset:contentOffset animated:animated];
+		if (!_preventScrollViewAdjustment) {
+			[self.scrollView setContentOffset:contentOffset animated:animated];
+		}
 	}
 }
 
@@ -261,7 +347,9 @@ typedef NS_ENUM(NSUInteger, TNKRefreshControlState) {
 		if (self.scrollView.contentOffset.y < zeroOffset) {
 			CGPoint contentOffset = self.scrollView.contentOffset;
 			contentOffset.y = zeroOffset;
-			[self.scrollView setContentOffset:contentOffset animated:NO];
+			if (!_preventScrollViewAdjustment) {
+				[self.scrollView setContentOffset:contentOffset animated:NO];
+			}
 		}
 	}];
 }
